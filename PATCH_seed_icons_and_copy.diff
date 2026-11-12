@@ -1,0 +1,208 @@
+--- a/stalcraft_trade_assistant_v2/app/vision/icons.py
++++ b/stalcraft_trade_assistant_v2/app/vision/icons.py
+@@ -29,7 +29,17 @@
+ 
+ 
+ def extract_icon_crop(cell_bgr: np.ndarray) -> np.ndarray:
+-    """Единая функция вырезания иконки — используется и для эталонов, и для кадров."""
++    """Вырезает иконку из карточки или возвращает готовый seed-кроп.
++
++    Эталоны в assets/seed_icons — это уже вырезанные изображения 72x74 px.
++    Повторно применять к ним ICON_BOX нельзя: это обрезает центральную часть
++    изображения и резко ухудшает совпадение.
++    """
++    if cell_bgr is None or cell_bgr.size == 0:
++        return cell_bgr
++    h, w = cell_bgr.shape[:2]
++    if (h, w) == (74, 72):
++        return cell_bgr
+     return crop_fraction(cell_bgr, layout.ICON_BOX)
+ 
+ 
+@@ -120,8 +130,8 @@
+         self._templates: dict[str, list[np.ndarray]] = {}
+ 
+     def set_templates(self, images_by_item: dict[str, list[np.ndarray]]) -> None:
+-        """images_by_item: item_id -> список ЦЕЛЫХ ячеек (карточек) с этим предметом.
+-        Иконка вырезается здесь той же функцией, что и при распознавании кадра."""
++        """images_by_item: item_id -> карточки или готовые seed-кропы иконок.
++        Для обоих форматов используется extract_icon_crop()."""
+         self._templates = {
+             item_id: [extract_features(extract_icon_crop(im)) for im in imgs
+                       if im is not None and im.size]
+--- a/stalcraft_trade_assistant_v2/app/price_database.py
++++ b/stalcraft_trade_assistant_v2/app/price_database.py
+@@ -109,20 +109,37 @@
+             """)
+ 
+     def _seed_if_empty(self) -> None:
+-        with self._lock:
+-            n = self._conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
++        """Добавляет стандартный каталог и недостающие seed-эталоны.
++
++        Не ограничиваемся пустой БД: после обновления приложения база пользователя
++        может уже содержать предметы, но не иметь шаблонов для новых/старых seed IDs.
++        Цены и пользовательские шаблоны существующих предметов не перезаписываются.
++        """
+         seed_file = SEED_ICONS_DIR / "seed_items.json"
+-        if n or not seed_file.exists():
++        if not seed_file.exists():
+             return
+-        for it in json.loads(seed_file.read_text(encoding="utf-8")):
+-            rec = ItemRecord(id=it["id"], name=it["name"], category=it.get("category", ""),
+-                             price=None, unit_weight=it.get("unit_weight"),
+-                             aliases=it.get("aliases", []))
+-            self.upsert_item(rec)
+-            src = SEED_ICONS_DIR / it["icon"]
+-            img = imread_unicode(src)
+-            if img is not None:
+-                self.add_template(rec.id, img)
++        seed_items = json.loads(seed_file.read_text(encoding="utf-8"))
++        for it in seed_items:
++            with self._lock:
++                row = self._conn.execute(
++                    "SELECT id FROM items WHERE id=?", (it["id"],)
++                ).fetchone()
++                template_count = self._conn.execute(
++                    "SELECT COUNT(*) FROM templates WHERE item_id=?", (it["id"],)
++                ).fetchone()[0]
++            if row is None:
++                rec = ItemRecord(
++                    id=it["id"], name=it["name"], category=it.get("category", ""),
++                    price=None, unit_weight=it.get("unit_weight"),
++                    aliases=it.get("aliases", [])
++                )
++                self.upsert_item(rec)
++                template_count = 0
++            if template_count == 0:
++                src = SEED_ICONS_DIR / it["icon"]
++                img = imread_unicode(src)
++                if img is not None:
++                    self.add_template(it["id"], img)
+ 
+     # ---- чтение -------------------------------------------------------------
+     def items(self) -> list[ItemRecord]:
+--- a/stalcraft_trade_assistant_v2/app/config.py
++++ b/stalcraft_trade_assistant_v2/app/config.py
+@@ -26,7 +26,7 @@
+     icon_min_score: float = 0.80
+     icon_min_margin: float = 0.10
+     always_on_top: bool = True
+-    hide_unknown_items: bool = True            # не показывать предметы, которых нет в прайс-листе
++    hide_unknown_items: bool = False           # неизвестные позиции всегда должны оставаться видимыми
+     icon_min_color: float = 0.50               # ниже — цвет не тот, предмет считается чужим
+     window_x: int | None = None
+     window_y: int | None = None
+--- a/stalcraft_trade_assistant_v2/app/gui/main_window.py
++++ b/stalcraft_trade_assistant_v2/app/gui/main_window.py
+@@ -226,13 +226,8 @@
+ 
+     def _render(self, items, seq: int | None = None) -> None:
+         self._all_items = list(items)
++        # Неизвестные позиции не скрываем даже при старом hide_unknown_items=true.
+         hidden = 0
+-        if self.cfg.hide_unknown_items:
+-            # один чужой предмет виден и на карточке, и в списке слева — считаем его один раз
+-            by_card = sum(1 for i in items if i.unknown and i.key.startswith("card:"))
+-            by_list = sum(1 for i in items if i.unknown and i.key.startswith("list:"))
+-            hidden = max(by_card, by_list)
+-            items = [i for i in items if not i.unknown]
+         self._accepted &= {i.key for i in items}
+         calc = calculate(items, self._accepted)
+         self._calc = calc
+@@ -298,21 +293,51 @@
+ 
+     # ---- кнопки ---------------------------------------------------------------
+     def copy_total(self) -> None:
+-        calc = self._calc
+-        if self.ledger.pending_count or self._verified_seq < self._fast_seq:
+-            self.set_status("Идёт проверка изменений — подождите долю секунды и нажмите снова.")
+-            return
+-        if calc.excluded:
++        # Берём текущие позиции последнего принятого сканирования. OCR может
++        # продолжаться в фоне: известные кандидаты с qty и ценой дают preview.
++        items = list(self._all_items)
++        if not items:
++            self.set_status("Нет актуальных позиций для копирования.")
++            return
++
++        confirmed = int(self.ledger.confirmed)
++        preliminary = sum(
++            int(it.amount) for it in items
++            if it.amount is not None and (it.item_id or it.candidate_id)
++        )
++        uncertain = [
++            it for it in items
++            if it.amount is None or not it.item_id or it.status != OK
++        ]
++        checking = self._verified_seq < self._fast_seq or self.ledger.pending_count > 0
++        is_preliminary = checking or bool(uncertain) or preliminary != confirmed
++
++        if is_preliminary:
++            unknown_count = sum(
++                1 for it in items if it.unknown or (not it.item_id and not it.candidate_id)
++            )
++            unpriced_count = sum(
++                1 for it in items
++                if (it.item_id or it.candidate_id) and it.amount is None
++            )
++            message = (
++                f"Предварительная сумма: {fmt(preliminary)}\n"
++                f"Подтверждено: {fmt(confirmed)}\n"
++                f"Позиции требуют проверки: {len(uncertain)}\n"
++                f"Неизвестные: {unknown_count}; без цены/количества: {unpriced_count}.\n\n"
++                "Скопировать предварительную сумму?"
++            )
+             ans = QMessageBox.question(
+-                self, "Есть не учтённые позиции",
+-                f"Не учтено позиций: {calc.excluded}. Сумма {fmt(self.ledger.confirmed)} посчитана без них.\n"
+-                "Скопировать всё равно?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+-                QMessageBox.StandardButton.No)
++                self, "Сумма ещё не подтверждена", message,
++                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                QMessageBox.StandardButton.Yes)
+             if ans != QMessageBox.StandardButton.Yes:
+                 return
+-        total = self.ledger.confirmed
+-        QGuiApplication.clipboard().setText(str(total))      # только число, без пробелов
+-        self.set_status(f"Скопировано: {total}")
++
++        total = preliminary if is_preliminary else confirmed
++        QGuiApplication.clipboard().setText(str(total))  # только число, без пробелов
++        self.set_status(("Предварительно скопировано: " if is_preliminary else
++                         "Скопировано: ") + str(total))
+ 
+     def toggle_pause(self) -> None:
+         paused = self.pause_btn.text() == "Пауза"
+         self.worker.set_paused(paused)
+         self.pause_btn.setText("Продолжить" if paused else "Пауза")
+         self.set_status("Пауза" if paused else "Сканирование…")
+--- /dev/null
++++ b/stalcraft_trade_assistant_v2/tests/test_seed_icon_templates.py
+@@ -0,0 +1,26 @@
++from pathlib import Path
++
++import cv2
++
++from app.vision.icons import extract_icon_crop, extract_features, similarity
++from app.paths import SEED_ICONS_DIR
++
++
++def test_seed_icon_png_is_not_cropped_twice():
++    for path in SEED_ICONS_DIR.glob("*.png"):
++        image = cv2.imread(str(path))
++        assert image is not None
++        crop = extract_icon_crop(image)
++        assert crop.shape == image.shape
++        assert similarity(extract_features(crop), extract_features(image)) > 0.999
++
++
++def test_full_card_still_uses_icon_roi():
++    import numpy as np
++    from app.vision import layout
++
++    card = np.zeros((76, 74, 3), dtype=np.uint8)
++    crop = extract_icon_crop(card)
++    expected_h = round(layout.ICON_BOX[3] * 76) - round(layout.ICON_BOX[1] * 76)
++    expected_w = round(layout.ICON_BOX[2] * 74) - round(layout.ICON_BOX[0] * 74)
++    assert crop.shape[:2] == (expected_h, expected_w)
